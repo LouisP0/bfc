@@ -155,7 +155,7 @@ fn compile_file(matches: &ArgMatches) -> Result<(), ()> {
         .get_one::<String>("llvm-opt")
         .expect("Required argument");
     let llvm_opt = llvm_opt_raw.parse::<i64>().expect("Validated by clap");
-    llvm::optimise_ir(&mut llvm_module, llvm_opt);
+    llvm::optimise_ir(&mut llvm_module, llvm_opt.try_into().unwrap());
 
     // Compile the LLVM IR to a temporary object file.
     let object_file = NamedTempFile::new().map_err(|e| {

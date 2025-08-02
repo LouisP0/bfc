@@ -1,24 +1,41 @@
 //! The LLVM module handles converting a BF AST to LLVM IR.
 
-use itertools::Itertools;
-use llvm_sys::core::*;
-use llvm_sys::prelude::*;
-use llvm_sys::target::*;
-use llvm_sys::target_machine::*;
-use llvm_sys::transforms::pass_manager_builder::*;
-use llvm_sys::{LLVMBuilder, LLVMIntPredicate, LLVMModule};
-
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_uint, c_ulonglong};
+use std::num::Wrapping;
+use std::os::raw::{c_char, c_uint, c_ulonglong};
 use std::ptr::null_mut;
 use std::str;
 
-use std::collections::HashMap;
-use std::num::Wrapping;
+use itertools::Itertools;
+use llvm_sys::core::{
+    LLVMAddFunction, LLVMAddGlobal, LLVMAppendBasicBlock, LLVMBuildAdd, LLVMBuildAlloca,
+    LLVMBuildBr, LLVMBuildCall2, LLVMBuildCondBr, LLVMBuildGEP2, LLVMBuildICmp,
+    LLVMBuildLoad2, LLVMBuildMul, LLVMBuildPointerCast, LLVMBuildRet, LLVMBuildSExt,
+    LLVMBuildStore, LLVMBuildTrunc, LLVMConstArray2, LLVMConstInt, LLVMCreateBuilder,
+    LLVMDisposeBuilder, LLVMDisposeMessage, LLVMDisposeModule, LLVMFunctionType,
+    LLVMGetElementType, LLVMGetFirstBasicBlock, LLVMGetNamedFunction, LLVMGetTarget,
+    LLVMInt1Type, LLVMInt32Type, LLVMInt8Type, LLVMPointerType, LLVMPositionBuilderAtEnd,
+    LLVMPrintModuleToString, LLVMSetGlobalConstant, LLVMSetInitializer, LLVMSetTarget,
+    LLVMTypeOf, LLVMVoidType, LLVMModuleCreateWithName, LLVMArrayType2,
+};
+use llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
+use llvm_sys::prelude::{LLVMBasicBlockRef, LLVMBool, LLVMTypeRef, LLVMValueRef};
+use llvm_sys::target_machine::{
+    LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCreateTargetMachine, LLVMDisposeTargetMachine,
+    LLVMRelocMode, LLVMTargetMachineEmitToFile, LLVMTargetMachineRef, LLVMCodeModel, LLVMTargetRef,
+    LLVMGetDefaultTargetTriple, LLVMGetTargetFromTriple,
+};
+use llvm_sys::target::{
+    LLVM_InitializeAllTargetInfos, LLVM_InitializeAllTargets, LLVM_InitializeAllTargetMCs,
+    LLVM_InitializeAllAsmParsers, LLVM_InitializeAllAsmPrinters,
+};
+use llvm_sys::transforms::pass_builder::{
+    LLVMCreatePassBuilderOptions, LLVMDisposePassBuilderOptions, LLVMRunPasses,
+};
+use llvm_sys::{LLVMBuilder, LLVMIntPredicate, LLVMModule};
 
-use crate::bfir::AstNode::*;
-use crate::bfir::{AstNode, BfValue};
-
+use crate::bfir::{AstNode, AstNode::*, BfValue};
 use crate::execution::ExecutionState;
 
 const LLVM_FALSE: LLVMBool = 0;
@@ -198,10 +215,15 @@ unsafe fn add_function_call(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
+    // 1) look up the function value
     let function = LLVMGetNamedFunction(module.module, module.new_string_ptr(fn_name));
-
-    LLVMBuildCall(
+    // 2) pull out its LLVMFunctionType
+    let fn_ptr_ty = LLVMTypeOf(function);
+    let fn_ty = LLVMGetElementType(fn_ptr_ty);
+    // 3) call the new API
+    LLVMBuildCall2(
         builder.builder,
+        fn_ty,
         function,
         args.as_mut_ptr(),
         args.len() as c_uint,
@@ -252,8 +274,9 @@ fn add_cells_init(
 
             // TODO: factor out a build_gep function.
             let mut offset_vec = vec![int32(offset as c_ulonglong)];
-            let offset_cell_ptr = LLVMBuildGEP(
+            let offset_cell_ptr = LLVMBuildGEP2(
                 builder.builder,
+                int8_type(), // Add type of pointee (i8)
                 cells_ptr,
                 offset_vec.as_mut_ptr(),
                 offset_vec.len() as u32,
@@ -382,22 +405,25 @@ unsafe fn add_current_cell_access(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
-    let cell_index = LLVMBuildLoad(
+    let cell_index = LLVMBuildLoad2(
         builder.builder,
+        int32_type(), // cell_index_ptr is a pointer to i32
         cell_index_ptr,
         module.new_string_ptr("cell_index"),
     );
 
     let mut indices = vec![cell_index];
-    let current_cell_ptr = LLVMBuildGEP(
+    let current_cell_ptr = LLVMBuildGEP2(
         builder.builder,
+        int8_type(), // ctx.cells is a pointer to i8
         cells,
         indices.as_mut_ptr(),
         indices.len() as u32,
         module.new_string_ptr("current_cell_ptr"),
     );
-    let current_cell = LLVMBuildLoad(
+    let current_cell = LLVMBuildLoad2(
         builder.builder,
+        int8_type(), // current_cell_ptr is a pointer to i8
         current_cell_ptr,
         module.new_string_ptr("cell_value"),
     );
@@ -415,8 +441,9 @@ unsafe fn compile_increment(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
-    let cell_index = LLVMBuildLoad(
+    let cell_index = LLVMBuildLoad2(
         builder.builder,
+        int32_type(), // ctx.cell_index_ptr is a pointer to i32
         ctx.cell_index_ptr,
         module.new_string_ptr("cell_index"),
     );
@@ -429,16 +456,17 @@ unsafe fn compile_increment(
     );
 
     let mut indices = vec![offset_cell_index];
-    let current_cell_ptr = LLVMBuildGEP(
+    let current_cell_ptr = LLVMBuildGEP2(
         builder.builder,
+        int8_type(), // ctx.cells is a pointer to i8
         ctx.cells,
         indices.as_mut_ptr(),
         indices.len() as c_uint,
         module.new_string_ptr("current_cell_ptr"),
     );
-
-    let cell_val = LLVMBuildLoad(
+    let cell_val = LLVMBuildLoad2(
         builder.builder,
+        int8_type(), // current_cell_ptr is a pointer to i8
         current_cell_ptr,
         module.new_string_ptr("cell_value"),
     );
@@ -465,8 +493,9 @@ unsafe fn compile_set(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
-    let cell_index = LLVMBuildLoad(
+    let cell_index = LLVMBuildLoad2(
         builder.builder,
+        int32_type(), // ctx.cell_index_ptr is a pointer to i32
         ctx.cell_index_ptr,
         module.new_string_ptr("cell_index"),
     );
@@ -479,14 +508,14 @@ unsafe fn compile_set(
     );
 
     let mut indices = vec![offset_cell_index];
-    let current_cell_ptr = LLVMBuildGEP(
+    let current_cell_ptr = LLVMBuildGEP2(
         builder.builder,
+        int8_type(), // ctx.cells is a pointer to i8
         ctx.cells,
         indices.as_mut_ptr(),
         indices.len() as c_uint,
         module.new_string_ptr("current_cell_ptr"),
     );
-
     LLVMBuildStore(
         builder.builder,
         int8(amount.0 as c_ulonglong),
@@ -542,8 +571,9 @@ unsafe fn compile_multiply_move(
     for target in targets {
         // Calculate the position of this target cell.
         let mut indices = vec![int32(*target as c_ulonglong)];
-        let target_cell_ptr = LLVMBuildGEP(
+        let target_cell_ptr = LLVMBuildGEP2(
             builder.builder,
+            int8_type(), // cell_val_ptr is a pointer to i8
             cell_val_ptr,
             indices.as_mut_ptr(),
             indices.len() as c_uint,
@@ -551,8 +581,9 @@ unsafe fn compile_multiply_move(
         );
 
         // Get the current value of the target cell.
-        let target_cell_val = LLVMBuildLoad(
+        let target_cell_val = LLVMBuildLoad2(
             builder.builder,
+            int8_type(), // target_cell_ptr is a pointer to i8
             target_cell_ptr,
             module.new_string_ptr("target_cell_val"),
         );
@@ -589,8 +620,9 @@ unsafe fn compile_ptr_increment(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
-    let cell_index = LLVMBuildLoad(
+    let cell_index = LLVMBuildLoad2(
         builder.builder,
+        int32_type(), // ctx.cell_index_ptr is a pointer to i32
         ctx.cell_index_ptr,
         module.new_string_ptr("cell_index"),
     );
@@ -614,15 +646,17 @@ unsafe fn compile_read(
     let builder = Builder::new();
     builder.position_at_end(bb);
 
-    let cell_index = LLVMBuildLoad(
+    let cell_index = LLVMBuildLoad2(
         builder.builder,
+        int32_type(), // ctx.cell_index_ptr is a pointer to i32
         ctx.cell_index_ptr,
         module.new_string_ptr("cell_index"),
     );
 
     let mut indices = vec![cell_index];
-    let current_cell_ptr = LLVMBuildGEP(
+    let current_cell_ptr = LLVMBuildGEP2(
         builder.builder,
+        int8_type(), // ctx.cells is a pointer to i8
         ctx.cells,
         indices.as_mut_ptr(),
         indices.len() as u32,
@@ -761,11 +795,11 @@ fn compile_static_outputs(module: &mut Module, bb: LLVMBasicBlockRef, outputs: &
             llvm_outputs.push(int8(*value as c_ulonglong));
         }
 
-        let output_buf_type = LLVMArrayType(int8_type(), llvm_outputs.len() as c_uint);
-        let llvm_outputs_arr = LLVMConstArray(
+        let output_buf_type = LLVMArrayType2(int8_type(), (llvm_outputs.len() as c_uint).into());
+        let llvm_outputs_arr = LLVMConstArray2(
             int8_type(),
             llvm_outputs.as_mut_ptr(),
-            llvm_outputs.len() as c_uint,
+            (llvm_outputs.len() as c_uint).into(),
         );
 
         let known_outputs = LLVMAddGlobal(
@@ -876,25 +910,38 @@ pub fn compile_to_module(
     }
 }
 
-pub fn optimise_ir(module: &mut Module, llvm_opt: i64) {
-    // TODO: add a verifier pass too.
+pub fn optimise_ir(module: &mut Module, llvm_opt: u32) {
     unsafe {
-        let builder = LLVMPassManagerBuilderCreate();
-        // E.g. if llvm_opt is 3, we want a pass equivalent to -O3.
-        LLVMPassManagerBuilderSetOptLevel(builder, llvm_opt as u32);
+        let options = LLVMCreatePassBuilderOptions();
 
-        let pass_manager = LLVMCreatePassManager();
-        LLVMPassManagerBuilderPopulateModulePassManager(builder, pass_manager);
+        let triple_cstr = LLVMGetDefaultTargetTriple();
+        let mut err_msg: *mut i8 = std::ptr::null_mut();
+        let mut target = std::ptr::null_mut();
+        LLVMGetTargetFromTriple(triple_cstr, &mut target, &mut err_msg);
+        let cpu = CString::new("generic").unwrap();
+        let features = CString::new("").unwrap();
+        let tm = LLVMCreateTargetMachine(
+            target,
+            triple_cstr,
+            cpu.as_ptr(),
+            features.as_ptr(),
+            LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+            LLVMRelocMode::LLVMRelocDefault,
+            LLVMCodeModel::LLVMCodeModelDefault,
+        );
 
-        LLVMPassManagerBuilderDispose(builder);
+        let pipeline = CString::new(format!("default<O{}>", llvm_opt)).unwrap();
 
-        // Run twice. This is a hack, we should really work out which
-        // optimisations need to run twice. See
-        // http://llvm.org/docs/Frontend/PerformanceTips.html#pass-ordering
-        LLVMRunPassManager(pass_manager, module.module);
-        LLVMRunPassManager(pass_manager, module.module);
+        let err = LLVMRunPasses(module.module, pipeline.as_ptr(), tm, options);
+        if !err.is_null() {
+            let err_msg_ptr = LLVMGetErrorMessage(err);
+            let msg = CStr::from_ptr(err_msg_ptr).to_string_lossy().into_owned();
+            LLVMDisposeErrorMessage(err_msg_ptr);
+            panic!("LLVMRunPasses failed: {}", msg);
+        }
 
-        LLVMDisposePassManager(pass_manager);
+        LLVMDisposePassBuilderOptions(options);
+        LLVMDisposeTargetMachine(tm);
     }
 }
 
@@ -915,8 +962,8 @@ struct TargetMachine {
 
 impl TargetMachine {
     fn new(target_triple: *const i8) -> Result<Self, String> {
-        let mut target = null_mut();
-        let mut err_msg_ptr = null_mut();
+        let mut target: LLVMTargetRef = null_mut();
+        let mut err_msg_ptr: *mut c_char = null_mut();
         unsafe {
             LLVMGetTargetFromTriple(target_triple, &mut target, &mut err_msg_ptr);
             if target.is_null() {

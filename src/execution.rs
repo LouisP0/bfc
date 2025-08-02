@@ -56,7 +56,7 @@ pub fn max_steps() -> u64 {
 /// Compile time speculative execution of instructions. We return the
 /// final state of the cells, any print side effects, and the point in
 /// the code we reached.
-pub fn execute(instrs: &[AstNode], steps: u64) -> (ExecutionState, Option<Warning>) {
+pub fn execute(instrs: &'_ [AstNode], steps: u64) -> (ExecutionState<'_>, Option<Warning>) {
     let mut state = ExecutionState::initial(instrs);
     let outcome = execute_with_state(instrs, &mut state, steps, None);
 
